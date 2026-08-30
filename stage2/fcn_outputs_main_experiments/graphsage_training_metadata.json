@@ -1,0 +1,16 @@
+{
+  "seed": 42,
+  "best_epoch": 17,
+  "best_validation_ap": 0.12359471778846028,
+  "pos_weight": 21.866971969604492,
+  "hidden_dim": 128,
+  "n_layers": 1,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "patience": 5,
+  "max_epochs": 50,
+  "early_stopping_metric": "Validation AP",
+  "training_split": "Train",
+  "message_passing_graph": "W=5 candidate adjacency",
+  "gold_edges_used_in_adjacency": false
+}

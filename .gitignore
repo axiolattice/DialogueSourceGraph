@@ -1,0 +1,6 @@
+# Large model weights
+checkpoints/**/model.safetensors
+checkpoints/**/pytorch_model.bin
+checkpoints/**/optimizer.pt
+checkpoints/**/scheduler.pt
+checkpoints/**/trainer_state.json

@@ -1,0 +1,47 @@
+{
+  "protocol": "fixed_176_44_55_train_validation_test_no_refit",
+  "seed": 42,
+  "outer_test_size": 0.2,
+  "inner_validation_size": 0.2,
+  "session_counts": {
+    "train": 176,
+    "validation": 44,
+    "test": 55
+  },
+  "target_validation_recall": 0.98,
+  "max_top_k": 5,
+  "selected_threshold": 3.4513274727032694e-07,
+  "selected_top_k": 4,
+  "scorer_refit_after_validation": false,
+  "test_labels_used_for_fitting_or_selection": false,
+  "validation_metrics": {
+    "total": 8379,
+    "true_edges": 299,
+    "pred_edges": 1915,
+    "tp": 294,
+    "fp": 1621,
+    "fn": 5,
+    "tn": 6459,
+    "precision": 0.1535248041775457,
+    "recall": 0.9832775919732442,
+    "f1": 0.26558265582655827,
+    "accuracy": 0.8059434300035804,
+    "auc": 0.95809319017186,
+    "ap": 0.5048018635932412
+  },
+  "test_metrics": {
+    "total": 10434,
+    "true_edges": 528,
+    "pred_edges": 2447,
+    "tp": 507,
+    "fp": 1940,
+    "fn": 21,
+    "tn": 7966,
+    "precision": 0.2071924805884757,
+    "recall": 0.9602272727272727,
+    "f1": 0.3408403361344538,
+    "accuracy": 0.8120567375886525,
+    "auc": 0.9727506745223281,
+    "ap": 0.8160712815400459
+  }
+}
