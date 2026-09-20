@@ -46,8 +46,12 @@ Hyperparameter protocol
 -----------------------
 - Stage 2A is fitted on Train only and is not refitted after validation.
 - lambda_0 and lambda_t are selected on Validation only.
+- If a selected penalty lies on the upper edge of its Validation grid, the
+  run stops before Test is read so that the grid can be expanded.
 - The frozen Stage 2A scorer and Stage 2B parameters are applied once to Test.
 - Test labels are never used for fitting or hyperparameter selection.
+- The exact solver is independently checked by enumerating every subset of
+  every retained target group (at most 2^5 subsets per group).
 
 Legacy SVMP rules, graph caps, budgets, hand-written structural bonuses,
 message passing, and greedy graph selection are not used.
@@ -56,6 +60,7 @@ message passing, and greedy graph selection are not used.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -76,20 +81,27 @@ from sklearn.preprocessing import StandardScaler
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = SCRIPT_DIR.parent
-
-DEFAULT_STAGE1_OUTDIR = PROJECT_DIR / "stage1" / "fcn_outputs_stage1_final"
-DEFAULT_STAGE2_OUTDIR = SCRIPT_DIR / "fcn_outputs_stage2_final"
+DEFAULT_STAGE1_OUTDIR = SCRIPT_DIR / "fcn_outputs_stage1"
+DEFAULT_STAGE2_OUTDIR = SCRIPT_DIR / "fcn_outputs_stage2"
 
 EXPECTED_TRAIN_SESSIONS = 176
 EXPECTED_VALIDATION_SESSIONS = 44
 EXPECTED_TEST_SESSIONS = 55
+EXPECTED_TRAIN_ROWS = 39880
+EXPECTED_VALIDATION_ROWS = 8379
+EXPECTED_TEST_ROWS = 10434
+EXPECTED_TRAIN_EDGES = 1744
+EXPECTED_VALIDATION_EDGES = 299
+EXPECTED_TEST_EDGES = 528
+MAX_CANDIDATES_PER_TARGET = 5
 SEED = 42
 
 # Formal Stage 2A feature set after ablation: one-dimensional recalibration.
 LOCAL_EVIDENCE_FEATURES: Tuple[str, ...] = (
     "stage1_prob",
 )
+if any("rationale" in feature.lower() for feature in LOCAL_EVIDENCE_FEATURES):
+    raise RuntimeError("Formal Stage 2A forbids rationale-derived features.")
 
 # Broad, regular validation grids centered on the scale used in the earlier
 # structured-objective experiments. They can be overridden from the CLI.
@@ -220,46 +232,162 @@ def save_csv(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def verify_three_way_inputs(
-    train_df: pd.DataFrame,
-    validation_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-) -> None:
-    required = {"session_id", "Q1_row", "Q2_row", "edge_label", "stage1_pred_edge"}
-    for name, df in (
-        ("Train", train_df),
-        ("Validation", validation_df),
-        ("Test", test_df),
-    ):
-        missing = sorted(required - set(df.columns))
-        if missing:
-            raise RuntimeError(f"{name} Stage 1 file is missing columns: {missing}")
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-    counts = (
-        int(train_df["session_id"].nunique()),
-        int(validation_df["session_id"].nunique()),
-        int(test_df["session_id"].nunique()),
-    )
-    expected = (
-        EXPECTED_TRAIN_SESSIONS,
-        EXPECTED_VALIDATION_SESSIONS,
-        EXPECTED_TEST_SESSIONS,
-    )
-    if counts != expected:
+
+def require_finite_numeric(df: pd.DataFrame, col: str, split_name: str) -> pd.Series:
+    values = pd.to_numeric(df[col], errors="coerce")
+    invalid = values.isna() | ~np.isfinite(values.to_numpy(dtype=float))
+    if bool(invalid.any()):
         raise RuntimeError(
-            f"Stage 1 inputs do not match frozen 176/44/55 split: "
-            f"observed={counts}, expected={expected}."
+            f"{split_name} column {col} contains {int(invalid.sum())} "
+            "missing or non-finite values."
+        )
+    return values.astype(float)
+
+
+def verify_stage1_partition(
+    df: pd.DataFrame,
+    split_name: str,
+    expected_rows: int,
+    expected_sessions: int,
+    expected_true_edges: int,
+) -> None:
+    required = {
+        "edge_id",
+        "session_id",
+        "Q1_row",
+        "Q2_row",
+        "edge_label",
+        "stage1_prob",
+        "stage1_pred_edge",
+    }
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise RuntimeError(f"{split_name} Stage 1 file is missing columns: {missing}")
+    if len(df) != expected_rows:
+        raise RuntimeError(
+            f"{split_name} row count mismatch: observed={len(df)}, "
+            f"expected={expected_rows}."
+        )
+    session_count = int(df["session_id"].astype(str).nunique())
+    if session_count != expected_sessions:
+        raise RuntimeError(
+            f"{split_name} session count mismatch: observed={session_count}, "
+            f"expected={expected_sessions}."
+        )
+    if df["edge_id"].astype(str).duplicated().any():
+        raise RuntimeError(f"{split_name} contains duplicated edge_id values.")
+    for col in ("session_id", "Q1_row", "Q2_row", "edge_id"):
+        if df[col].isna().any() or df[col].astype(str).str.strip().eq("").any():
+            raise RuntimeError(f"{split_name} contains an empty {col} value.")
+
+    labels = require_finite_numeric(df, "edge_label", split_name)
+    predictions = require_finite_numeric(df, "stage1_pred_edge", split_name)
+    scores = require_finite_numeric(df, "stage1_prob", split_name)
+    if not set(labels.unique()).issubset({0.0, 1.0}):
+        raise RuntimeError(f"{split_name} edge_label must contain only 0/1.")
+    if not set(predictions.unique()).issubset({0.0, 1.0}):
+        raise RuntimeError(f"{split_name} stage1_pred_edge must contain only 0/1.")
+    if ((scores < 0.0) | (scores > 1.0)).any():
+        raise RuntimeError(f"{split_name} stage1_prob must lie in [0,1].")
+    if int(labels.sum()) != expected_true_edges:
+        raise RuntimeError(
+            f"{split_name} true-edge count mismatch: observed={int(labels.sum())}, "
+            f"expected={expected_true_edges}."
         )
 
-    train_ids = set(train_df["session_id"].astype(str))
-    validation_ids = set(validation_df["session_id"].astype(str))
-    test_ids = set(test_df["session_id"].astype(str))
-    if train_ids & validation_ids:
-        raise RuntimeError("Train and Validation sessions overlap.")
-    if train_ids & test_ids:
-        raise RuntimeError("Train and Test sessions overlap.")
-    if validation_ids & test_ids:
-        raise RuntimeError("Validation and Test sessions overlap.")
+    retained = df.loc[predictions.astype(int).eq(1)]
+    if not retained.empty:
+        max_target_candidates = int(
+            retained.groupby(["session_id", "Q2_row"], dropna=False).size().max()
+        )
+        if max_target_candidates > MAX_CANDIDATES_PER_TARGET:
+            raise RuntimeError(
+                f"{split_name} has {max_target_candidates} retained candidates "
+                f"for one target; expected at most {MAX_CANDIDATES_PER_TARGET}."
+            )
+
+
+def verify_disjoint_sessions(named_frames: Sequence[Tuple[str, pd.DataFrame]]) -> None:
+    session_sets = {
+        name: set(frame["session_id"].astype(str))
+        for name, frame in named_frames
+    }
+    names = list(session_sets)
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            if session_sets[left] & session_sets[right]:
+                raise RuntimeError(f"{left} and {right} sessions overlap.")
+
+
+def load_and_verify_stage1_params(stage1_outdir: Path) -> Dict[str, object]:
+    path = stage1_outdir / "stage1_final_selected_params.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing Stage 1 parameter manifest: {path}")
+    params = json.loads(path.read_text(encoding="utf-8"))
+    required_values = {
+        "retention_orientation": "source_conditioned",
+        "retention_group_keys": ["session_id", "Q1_row"],
+        "encoder_train_only": True,
+        "encoder_training_objective": "positive_pair_mnrl_only",
+        "rationale_derived_supervision": False,
+        "scorer_refit_after_validation": False,
+        "test_labels_used_for_fitting_or_selection": False,
+    }
+    mismatches = {
+        key: {"observed": params.get(key), "required": expected}
+        for key, expected in required_values.items()
+        if params.get(key) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"Stage 1 protocol manifest mismatch: {mismatches}")
+    expected_session_counts = {
+        "train": EXPECTED_TRAIN_SESSIONS,
+        "validation": EXPECTED_VALIDATION_SESSIONS,
+        "test": EXPECTED_TEST_SESSIONS,
+    }
+    if params.get("session_counts") != expected_session_counts:
+        raise RuntimeError(
+            "Stage 1 session-count manifest mismatch: "
+            f"observed={params.get('session_counts')}, "
+            f"required={expected_session_counts}."
+        )
+    threshold = float(params.get("selected_threshold", float("nan")))
+    top_k = int(params.get("selected_top_k", 0))
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise RuntimeError("Stage 1 selected_threshold is invalid.")
+    if not 1 <= top_k <= MAX_CANDIDATES_PER_TARGET:
+        raise RuntimeError("Stage 1 selected_top_k is outside [1,5].")
+    return params
+
+
+def verify_stage1_retention(
+    df: pd.DataFrame,
+    split_name: str,
+    threshold: float,
+    top_k: int,
+) -> None:
+    scores = require_finite_numeric(df, "stage1_prob", split_name)
+    ranks = scores.groupby(
+        [df["session_id"].astype(str), df["Q1_row"].astype(str)],
+        sort=False,
+    ).rank(method="first", ascending=False)
+    expected = ((scores >= threshold) & (ranks <= top_k)).astype(int)
+    observed = require_finite_numeric(
+        df, "stage1_pred_edge", split_name
+    ).astype(int)
+    mismatches = int((expected.to_numpy() != observed.to_numpy()).sum())
+    if mismatches:
+        raise RuntimeError(
+            f"{split_name} Stage 1 retention differs from its frozen "
+            f"source-wise policy on {mismatches} rows."
+        )
 
 
 # =============================================================================
@@ -506,6 +634,135 @@ def exact_targetwise_recovery(
     return out, params
 
 
+def exhaustive_targetwise_audit(
+    stage2a_df: pd.DataFrame,
+    recovered_df: pd.DataFrame,
+    lambda_0: float,
+    lambda_t: float,
+    split_name: str,
+    tolerance: float = 1e-10,
+) -> Dict[str, object]:
+    """Independently verify the solver against all subsets per target.
+
+    This audit does not use edge labels. With W=5, each target has at most
+    five retained candidates, so a complete 2^m enumeration is inexpensive.
+    """
+    base = stage2a_df.copy().reset_index(drop=True)
+    recovered = recovered_df.copy().reset_index(drop=True)
+    if len(base) != len(recovered):
+        raise RuntimeError(
+            f"{split_name} exactness audit received different row counts."
+        )
+
+    candidate_mask = (
+        get_numeric(base, "stage2_graph_input_pred", 0.0).astype(int) == 1
+    )
+    solver_selected = get_numeric(
+        recovered,
+        "final_graph_pred_edge",
+        0.0,
+    ).astype(int)
+    if int(solver_selected.loc[~candidate_mask].sum()) != 0:
+        raise RuntimeError(
+            f"{split_name} solver selected an edge excluded by Stage 1."
+        )
+
+    evidence = require_finite_numeric(
+        base,
+        "stage2a_local_evidence",
+        split_name,
+    )
+    all_target_groups = 0
+    candidate_target_groups = 0
+    max_candidates = 0
+    enumerated_subsets = 0
+    objective_mismatches = 0
+    subset_mismatches = 0
+    max_objective_gap = 0.0
+
+    for _, group in base.groupby(
+        ["session_id", "Q2_row"],
+        sort=False,
+        dropna=False,
+    ):
+        all_target_groups += 1
+        idxs = [
+            int(idx)
+            for idx in group.index
+            if bool(candidate_mask.loc[idx])
+        ]
+        if not idxs:
+            continue
+
+        candidate_target_groups += 1
+        order = sorted(
+            idxs,
+            key=lambda idx: (-float(evidence.loc[idx]), int(idx)),
+        )
+        m = len(order)
+        max_candidates = max(max_candidates, m)
+        if m > MAX_CANDIDATES_PER_TARGET:
+            raise RuntimeError(
+                f"{split_name} exactness audit found {m} candidates for one "
+                f"target; maximum is {MAX_CANDIDATES_PER_TARGET}."
+            )
+
+        r = [float(evidence.loc[idx]) for idx in order]
+        values: List[float] = []
+        for mask in range(1 << m):
+            k = int(bin(mask).count("1"))
+            selected_evidence = sum(
+                r[pos]
+                for pos in range(m)
+                if mask & (1 << pos)
+            )
+            values.append(
+                float(
+                    selected_evidence
+                    - float(lambda_0) * k
+                    - float(lambda_t) * k * (k - 1) / 2.0
+                )
+            )
+
+        enumerated_subsets += len(values)
+        best_value = max(values)
+        solver_mask = 0
+        for pos, idx in enumerate(order):
+            if int(solver_selected.loc[idx]) == 1:
+                solver_mask |= 1 << pos
+        solver_value = values[solver_mask]
+        objective_gap = max(0.0, float(best_value - solver_value))
+        max_objective_gap = max(max_objective_gap, objective_gap)
+        if objective_gap > tolerance:
+            objective_mismatches += 1
+
+        optimal_masks = {
+            mask
+            for mask, value in enumerate(values)
+            if abs(float(value - best_value)) <= tolerance
+        }
+        if solver_mask not in optimal_masks:
+            subset_mismatches += 1
+
+    audit: Dict[str, object] = {
+        "split": split_name,
+        "all_target_groups": int(all_target_groups),
+        "candidate_target_groups": int(candidate_target_groups),
+        "max_candidates_per_target": int(max_candidates),
+        "enumerated_subsets": int(enumerated_subsets),
+        "objective_mismatches": int(objective_mismatches),
+        "subset_mismatches": int(subset_mismatches),
+        "max_objective_gap": float(max_objective_gap),
+        "tolerance": float(tolerance),
+        "passed": bool(
+            objective_mismatches == 0 and subset_mismatches == 0
+        ),
+    }
+    if not audit["passed"]:
+        raise RuntimeError(f"{split_name} exactness audit failed: {audit}")
+    return audit
+
+
 # =============================================================================
 # Validation selection
 # =============================================================================
@@ -572,6 +829,28 @@ def validation_grid_search(
         float(best["lambda_t"]),
         search,
     )
+
+
+def reject_upper_grid_boundary(
+    parameter_name: str,
+    selected_value: float,
+    grid: Sequence[float],
+) -> None:
+    """Stop before Test if Validation selects an unexplored upper boundary."""
+    values = sorted(set(float(value) for value in grid))
+    if len(values) <= 1:
+        return
+    if np.isclose(
+        float(selected_value),
+        float(values[-1]),
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise RuntimeError(
+            f"Validation selected {parameter_name}={selected_value:g}, the "
+            f"upper boundary of [{values[0]:g}, {values[-1]:g}]. Expand only "
+            "this Validation grid and rerun; Formal Test has not been read."
+        )
 
 
 # =============================================================================
@@ -666,14 +945,30 @@ def main() -> None:
     stage1_outdir = Path(args.stage1_outdir)
     outdir = Path(args.stage2_outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    run_status_file = outdir / "stage2_run_status.json"
+    run_status = {
+        "completed": False,
+        "formal_test_loaded": False,
+        "message": "Validation-only work in progress; do not report Test results.",
+    }
+    run_status_file.write_text(
+        json.dumps(run_status, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     train_file = stage1_outdir / "stage1_train_scored.csv"
     validation_file = stage1_outdir / "stage1_validation_scored.csv"
     test_file = stage1_outdir / "stage1_test_scored.csv"
+    stage1_params_file = stage1_outdir / "stage1_final_selected_params.json"
 
     missing = [
         str(path)
-        for path in (train_file, validation_file, test_file)
+        for path in (
+            train_file,
+            validation_file,
+            test_file,
+            stage1_params_file,
+        )
         if not path.exists()
     ]
     if missing:
@@ -682,34 +977,62 @@ def main() -> None:
             + "\n  ".join(missing)
         )
 
+    stage1_params = load_and_verify_stage1_params(stage1_outdir)
+    stage1_threshold = float(stage1_params["selected_threshold"])
+    stage1_top_k = int(stage1_params["selected_top_k"])
+
+    # Physically read only Train and Validation before all model and penalty
+    # choices are frozen. Merely checking that the Test path exists above does
+    # not load its contents.
     train_df = pd.read_csv(train_file, low_memory=False)
     validation_df = pd.read_csv(validation_file, low_memory=False)
-    test_df = pd.read_csv(test_file, low_memory=False)
-
-    verify_three_way_inputs(
+    verify_stage1_partition(
         train_df,
+        "Train",
+        EXPECTED_TRAIN_ROWS,
+        EXPECTED_TRAIN_SESSIONS,
+        EXPECTED_TRAIN_EDGES,
+    )
+    verify_stage1_partition(
         validation_df,
-        test_df,
+        "Validation",
+        EXPECTED_VALIDATION_ROWS,
+        EXPECTED_VALIDATION_SESSIONS,
+        EXPECTED_VALIDATION_EDGES,
+    )
+    verify_disjoint_sessions(
+        [("Train", train_df), ("Validation", validation_df)]
+    )
+    verify_stage1_retention(
+        train_df,
+        "Train",
+        stage1_threshold,
+        stage1_top_k,
+    )
+    verify_stage1_retention(
+        validation_df,
+        "Validation",
+        stage1_threshold,
+        stage1_top_k,
     )
 
     print_block(
-        "Stage 2 Input Protocol",
+        "Stage 2 Train / Validation Input Protocol (Test Not Read)",
         {
             "train_rows": len(train_df),
             "validation_rows": len(validation_df),
-            "test_rows": len(test_df),
             "train_sessions": train_df["session_id"].nunique(),
             "validation_sessions": validation_df["session_id"].nunique(),
-            "test_sessions": test_df["session_id"].nunique(),
             "train_stage1_candidates": int(
                 get_numeric(train_df, "stage1_pred_edge").sum()
             ),
             "validation_stage1_candidates": int(
                 get_numeric(validation_df, "stage1_pred_edge").sum()
             ),
-            "test_stage1_candidates": int(
-                get_numeric(test_df, "stage1_pred_edge").sum()
-            ),
+            "stage1_retention_orientation": "source_conditioned",
+            "stage1_selected_threshold": f"{stage1_threshold:.16e}",
+            "stage1_selected_top_k": stage1_top_k,
+            "formal_test_status": "not_read",
         },
     )
 
@@ -803,6 +1126,19 @@ def main() -> None:
         },
     )
 
+    # A boundary optimum is not accepted as a frozen hyperparameter because
+    # it leaves the explored Validation range demonstrably unresolved.
+    reject_upper_grid_boundary(
+        "lambda_0",
+        selected_lambda0,
+        args.lambda0_grid,
+    )
+    reject_upper_grid_boundary(
+        "lambda_t",
+        selected_lambdat,
+        args.lambdat_grid,
+    )
+
     # Freeze parameters. No model refit and no parameter selection occurs
     # after this point.
     final_train, train_params = exact_targetwise_recovery(
@@ -816,9 +1152,65 @@ def main() -> None:
         lambda_t=selected_lambdat,
     )
 
+    train_exactness = exhaustive_targetwise_audit(
+        stage2a_train,
+        final_train,
+        lambda_0=selected_lambda0,
+        lambda_t=selected_lambdat,
+        split_name="Train",
+    )
+    validation_exactness = exhaustive_targetwise_audit(
+        stage2a_validation,
+        final_validation,
+        lambda_0=selected_lambda0,
+        lambda_t=selected_lambdat,
+        split_name="Validation",
+    )
+
     # -----------------------------------------------------------------
     # Formal Test: score and recover exactly once after freezing.
     # -----------------------------------------------------------------
+    test_df = pd.read_csv(test_file, low_memory=False)
+    run_status["formal_test_loaded"] = True
+    run_status["message"] = (
+        "Parameters frozen; Formal Test evaluation in progress."
+    )
+    run_status_file.write_text(
+        json.dumps(run_status, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    verify_stage1_partition(
+        test_df,
+        "Test",
+        EXPECTED_TEST_ROWS,
+        EXPECTED_TEST_SESSIONS,
+        EXPECTED_TEST_EDGES,
+    )
+    verify_disjoint_sessions(
+        [
+            ("Train", train_df),
+            ("Validation", validation_df),
+            ("Test", test_df),
+        ]
+    )
+    verify_stage1_retention(
+        test_df,
+        "Test",
+        stage1_threshold,
+        stage1_top_k,
+    )
+    print_block(
+        "Formal Test Input (Loaded After Parameter Freezing)",
+        {
+            "test_rows": len(test_df),
+            "test_sessions": test_df["session_id"].nunique(),
+            "test_stage1_candidates": int(
+                get_numeric(test_df, "stage1_pred_edge").sum()
+            ),
+            "formal_test_status": "loaded_after_validation_selection",
+        },
+    )
+
     stage2a_test = run_stage2a(test_df, local_model)
     save_csv(
         stage2a_test,
@@ -834,6 +1226,44 @@ def main() -> None:
         stage2a_test,
         lambda_0=selected_lambda0,
         lambda_t=selected_lambdat,
+    )
+    test_exactness = exhaustive_targetwise_audit(
+        stage2a_test,
+        final_test,
+        lambda_0=selected_lambda0,
+        lambda_t=selected_lambdat,
+        split_name="Test",
+    )
+    exactness_rows = [
+        train_exactness,
+        validation_exactness,
+        test_exactness,
+    ]
+    save_csv(
+        pd.DataFrame(exactness_rows),
+        outdir / "stage2_exactness_audit.csv",
+    )
+    print_block(
+        "Stage 2B Exhaustive Exactness Audit",
+        {
+            "audited_splits": "Train, Validation, Test",
+            "candidate_target_groups": int(
+                sum(row["candidate_target_groups"] for row in exactness_rows)
+            ),
+            "enumerated_subsets": int(
+                sum(row["enumerated_subsets"] for row in exactness_rows)
+            ),
+            "max_candidates_per_target": int(
+                max(row["max_candidates_per_target"] for row in exactness_rows)
+            ),
+            "objective_mismatches": int(
+                sum(row["objective_mismatches"] for row in exactness_rows)
+            ),
+            "subset_mismatches": int(
+                sum(row["subset_mismatches"] for row in exactness_rows)
+            ),
+            "passed": all(bool(row["passed"]) for row in exactness_rows),
+        },
     )
 
     train_metrics = binary_metrics(
@@ -891,7 +1321,25 @@ def main() -> None:
     )
 
     selected_params = {
-        "protocol": "train_validation_test_no_refit",
+        "protocol": "train_validation_test_no_refit_test_read_after_freeze",
+        "rationale_derived_supervision": False,
+        "stage1_input": {
+            "retention_orientation": stage1_params["retention_orientation"],
+            "retention_group_keys": stage1_params["retention_group_keys"],
+            "selected_threshold": stage1_threshold,
+            "selected_top_k": stage1_top_k,
+            "parameter_manifest_sha256": sha256_file(stage1_params_file),
+            "train_scored_sha256": sha256_file(train_file),
+            "validation_scored_sha256": sha256_file(validation_file),
+            "test_scored_sha256": sha256_file(test_file),
+        },
+        "split_protocol": {
+            "train_sessions": EXPECTED_TRAIN_SESSIONS,
+            "validation_sessions": EXPECTED_VALIDATION_SESSIONS,
+            "test_sessions": EXPECTED_TEST_SESSIONS,
+            "sessions_disjoint": True,
+            "test_loaded_after_validation_selection": True,
+        },
         "stage2a": {
             "model": "StandardScaler + class-balanced LogisticRegression",
             "local_c": float(args.local_c),
@@ -913,6 +1361,15 @@ def main() -> None:
             "selected_lambda_t": float(selected_lambdat),
             "lambda0_grid": [float(x) for x in args.lambda0_grid],
             "lambdat_grid": [float(x) for x in args.lambdat_grid],
+            "upper_grid_boundary_rejected": True,
+        },
+        "exactness_audit": {
+            "method": "all_subsets_per_target",
+            "max_subsets_per_target": int(2 ** MAX_CANDIDATES_PER_TARGET),
+            "splits": {
+                row["split"]: row
+                for row in exactness_rows
+            },
         },
         "test_labels_used_for_fitting_or_selection": False,
         "validation_metrics": {
@@ -951,6 +1408,21 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    run_status.update(
+        {
+            "completed": True,
+            "formal_test_loaded": True,
+            "message": "FCN Stage 2 completed successfully.",
+            "selected_lambda_0": float(selected_lambda0),
+            "selected_lambda_t": float(selected_lambdat),
+            "exactness_audit_passed": True,
+        }
+    )
+    run_status_file.write_text(
+        json.dumps(run_status, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     print("\n" + "=" * 86)
     print("FCN Stage 2 completed successfully")
     print("=" * 86)
@@ -959,6 +1431,7 @@ def main() -> None:
         "Stage 2A model fitted once on Train; Stage 2B parameters selected "
         "on Validation; Formal Test evaluated after freezing."
     )
+    print("Exact target-wise solver independently verified by all-subset audit.")
     print(
         "Test graph: stage2_test_final_graph.csv"
     )

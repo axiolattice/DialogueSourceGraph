@@ -1,29 +1,34 @@
-# FCN Project New
+# FCN Experiment Scripts
 
-This folder contains the final runnable code for the FCN pipeline.
+This package contains the Python scripts used for the FCN follow-up network experiments.
 
-## Main Files
+## Directory Structure
 
-- `preprocess/finetune_m3e_mnrl.py`: fine-tunes the Stage 1 encoder on the labeled data.
-- `preprocess/build_reason_proto_targeted.py`: builds the targeted fine-tuning dataset used by the encoder script.
-- `stage1/FCN_stage1_Candidate.py`: runs Stage 1 candidate retention and writes the frozen Stage 1 outputs.
-- `stage2/FCN_stage2_structured.py`: runs the formal Stage 2 model with one-dimensional Stage 2A evidence and exact Stage 2B recovery.
-- `stage2/FCN_stage2_structure_ablation.py`: compares M0 / M1 / M2 structure variants.
-- `stage2/FCN_stage2A_ablation.py`: compares the Stage 2A feature settings.
-- `stage2/FCN_main_experiments_3split.py`: runs the main baselines, GraphSAGE, bootstrap, and final FCN comparison.
+- `preprocess/`: LLM-assisted labeling demo and encoder fine-tuning.
+- `stage1/`: candidate-edge retention and Stage 1 scoring.
+- `stage2/`: structured graph recovery and baseline comparisons.
+- `experiments/`: ablation, robustness, diagnostic, and plotting scripts.
 
-## Recommended Order
+## Typical Workflow
 
-1. Fine-tune the encoder.
-2. Run Stage 1.
-3. Run the formal Stage 2 script.
-4. Run the Stage 2 ablations if needed.
-5. Run the main experiment script.
+1. Prepare the labeled dataset and session split manifest locally.
+2. Optionally fine-tune the retrieval encoder with `preprocess/finetune_m3e_mnrl.py`.
+3. Run Stage 1 with `stage1/FCN_stage1_Candidate.py`.
+4. Run Stage 2 with `stage2/FCN_stage2_structured.py`.
+5. Run baseline comparisons with `stage2/FCN_main_experiments_3split.py`.
+6. Run supplementary analyses under `experiments/`.
 
-## Key Data And Outputs
+## Dependencies
 
-- `train data/fcn_30firms_full_labeled.csv`: final labeled dataset.
-- `train data/targeted_reason_proto_augmented.csv`: targeted fine-tuning data.
-- `checkpoints/fcn-m3e-base-mnrl/`: fine-tuned encoder checkpoint.
+The scripts mainly use:
 
-The scripts are intended to run directly with their default paths.
+- Python 3.9+
+- pandas, numpy, scikit-learn
+- torch
+- sentence-transformers
+- transformers
+- modelscope
+- openai
+- matplotlib
+
+Install the exact versions according to your local environment and GPU/CUDA setup.

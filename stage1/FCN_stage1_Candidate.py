@@ -6,16 +6,19 @@ Frozen protocol
 - Train:      176 sessions
 - Validation:  44 sessions
 - Test:        55 sessions
-- Session split seed: 42
+- Session assignment: mandatory external manifest shared with encoder training
 - Stage 1 scorer: StandardScaler + class-balanced Logistic Regression
 - Scorer fitting: Train only, exactly once
 - Retention selection: Validation only
 - Target validation candidate-edge recall: 0.98
-- Search: Top-K in {1,2,3,4,5}; threshold selected exactly from validation scores
+- Search: source-wise Top-K in {1,2,3,4,5}; threshold selected exactly from
+  validation scores
 - Selection criterion: minimize retained validation candidates subject to
   Recall >= 0.98
 - No scorer refit after validation
 - Test labels are never used for fitting or parameter selection
+- The encoder provenance must certify Train-only positive-pair MNRL with no
+  rationale, targeted, hard-negative, or direction-auxiliary supervision
 
 Outputs for Stage 2A
 --------------------
@@ -30,12 +33,15 @@ the earlier revised/sensitivity Stage 1 scripts.
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
+import inspect
 import json
 import logging
 import math
 import os
 import re
-import sys
+import textwrap
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -52,46 +58,91 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
-if str(PROJECT_DIR) not in sys.path:
-    sys.path.insert(0, str(PROJECT_DIR))
-
-from followup_semantics import (
-    ANSWER_UNSATISFIED_TERMS,
-    Q2_EXPLAIN_ONLY_TERMS,
-    Q2_PRESSURE_TERMS,
-    build_semantic_bridge,
-    clean_text,
-)
-
-try:
-    from modelscope import snapshot_download
-except Exception:  # pragma: no cover - modelscope may be absent in minimal envs.
-    snapshot_download = None
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 LOGGER = logging.getLogger("fcn-stage1-retention")
-stage1 = sys.modules[__name__]
 SEED = 42
 
 # Frozen final Stage 1 protocol.
-OUTER_TEST_SIZE = 0.20
-INNER_VALIDATION_SIZE = 0.20
 TARGET_VALIDATION_RECALL = 0.98
 MAX_TOP_K = 5
 EXPECTED_TRAIN_SESSIONS = 176
 EXPECTED_VALIDATION_SESSIONS = 44
 EXPECTED_TEST_SESSIONS = 55
 DEFAULT_DATA_FILE = PROJECT_DIR / "train data" / "fcn_30firms_full_labeled.csv"
-DEFAULT_MODEL_DIR = PROJECT_DIR / "checkpoints" / "fcn-m3e-base-mnrl"
-DEFAULT_STAGE1_OUTDIR = PROJECT_DIR / "stage1" / "fcn_outputs_stage1_final"
-DEFAULT_MODELSCOPE_CACHE = "./checkpoints"
+DEFAULT_SESSION_MANIFEST = PROJECT_DIR / "train data" / "session_split_manifest.csv"
+DEFAULT_MODEL_DIR = PROJECT_DIR / "checkpoints" / "fcn-m3e-base-train-only"
+DEFAULT_STAGE1_OUTDIR = PROJECT_DIR / "fcn_outputs_stage1"
+INPUT_FORMAT = "raw_q1_a1__q2_v1"
+
+
+def clean_text(value: object) -> str:
+    """Convert a value to normalized, single-space text."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    return " ".join(str(value).split())
+
+
+def build_anchor_text(q1: object, a1: object) -> str:
+    """Build the encoder input for a candidate source turn."""
+    return f"前序问题：{clean_text(q1)} 管理层回答：{clean_text(a1)}"
+
+
+def build_candidate_text(q2: object) -> str:
+    """Build the encoder input for a later query."""
+    return f"当前追问：{clean_text(q2)}"
+
+
+def text_protocol_fingerprint() -> str:
+    """Hash the executable text-normalization/template contract."""
+    normalized_functions = []
+    for function in (clean_text, build_anchor_text, build_candidate_text):
+        node = ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+        # Documentation changes do not alter the executable protocol.
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            node.body = node.body[1:]
+        normalized_functions.append(ast.dump(node, include_attributes=False))
+    payload = "\n".join(normalized_functions).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+TEXT_PROTOCOL_SHA256 = text_protocol_fingerprint()
+
+
+# Stage 1-only fixed interaction lexicons.
+ANSWER_UNSATISFIED_TERMS = [
+    "感谢关注", "谢谢", "请关注", "关注公告", "以公告为准", "以公司公告为准",
+    "详见公告", "后续公告", "及时公告", "信息披露", "不便评价", "无法评价",
+    "无法判断", "按规定", "按要求", "会努力", "努力工作", "持续关注",
+]
+Q2_PRESSURE_TERMS = [
+    "请正面回答", "正面回答", "明确回答", "请回答", "为什么不回答", "为何不回答",
+    "为何不披露", "为什么不披露", "绕弯子", "言之无物", "外交辞令", "敷衍",
+    "漠视", "知情权", "隐瞒", "忽悠", "欺骗", "遮遮掩掩", "到底", "问责",
+    "解释一下", "给明确回答", "给个明确", "给个明确的回答", "明确的回答",
+    "请明确", "作解释", "请作解释", "作下解释", "下解释", "作出解释",
+    "做出解释", "请您明确回答", "回答我的两个问题", "请回答我的两个问题",
+    "正面回应", "请正面回应", "直面回答", "从不直面回答", "不要回避",
+    "明确目标", "明确的目标",
+]
+Q2_EXPLAIN_ONLY_TERMS = [
+    "解释一下", "说明一下", "请说明", "说一下", "介绍一下", "讲一下", "具体说说",
+    "具体说明", "具体介绍", "详细说明", "详细介绍", "详细讲讲", "具体讲讲",
+    "请讲", "请介绍",
+]
 A1_CLAIM_TERMS = [
     "因为",
     "由于",
@@ -790,52 +841,108 @@ STRUCTURED_TERM_STOPWORDS = {
     "披露",
 }
 
-def build_anchor_text(q1: object, a1: object) -> str:
-    """Build the fixed Stage 1 anchor text used in the reported experiments.
-
-    The semantic bridge is transcript-derived from A1 and was active in the
-    original no-prompt experiment command. It is therefore part of the frozen
-    Stage 1 input transformation.
-    """
-    q1_text = clean_text(q1)
-    a1_text = clean_text(a1)
-    # Deterministic answer-side preprocessing used before encoding.
-    # It depends only on the observed managerial response A1 and does not use
-    # labels, rationales, candidate-query information, or evaluation data.
-    # This is an implementation-level input transformation, not a separate
-    # FCN prediction component.
-    semantic_bridge = build_semantic_bridge(a1_text)
-
-    return "前序问题：" + q1_text + " 管理层回答：" + a1_text + semantic_bridge
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def build_candidate_text(q2: object) -> str:
-    """Build the fixed later-query text used in the reported experiments."""
-    q2_text = clean_text(q2)
-    return "当前追问：" + q2_text
+def normalize_split(value: object) -> str:
+    split = clean_text(value).lower()
+    aliases = {"val": "validation", "valid": "validation", "dev": "validation"}
+    return aliases.get(split, split)
 
 
-def resolve_model_path(model_id_or_path: str, cache_dir: str = DEFAULT_MODELSCOPE_CACHE) -> str:
-    normalized = str(model_id_or_path).strip()
-    if not normalized or normalized in {".", "./"}:
-        normalized = str(DEFAULT_MODEL_DIR)
-    path = Path(normalized)
-    if path.is_dir() and ((path / "config.json").exists() or (path / "modules.json").exists()):
-        return str(path)
-    if path.exists() and path.is_file():
-        return str(path)
-    if path.is_dir():
-        return str(path)
-    if os.path.exists(normalized):
-        return normalized
-    if snapshot_download is None:
-        raise RuntimeError("modelscope is not installed. Please install it with: pip3 install modelscope")
-    try:
-        resolved = snapshot_download(normalized, cache_dir=cache_dir)
-        LOGGER.info("Downloaded/resolved ModelScope model %s -> %s", normalized, resolved)
-        return resolved
-    except Exception as exc:
-        raise RuntimeError(f"ModelScope snapshot_download failed for {normalized}: {exc}") from exc
+def load_session_manifest(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError(f"Session manifest does not exist: {path}")
+    manifest = pd.read_csv(path, encoding="utf-8-sig", dtype={"session_id": str})
+    required = {"session_id", "split"}
+    missing = required - set(manifest.columns)
+    if missing:
+        raise ValueError(f"Session manifest missing columns: {sorted(missing)}")
+    manifest = manifest.loc[:, ["session_id", "split"]].copy()
+    manifest["session_id"] = manifest["session_id"].map(clean_text)
+    manifest["split"] = manifest["split"].map(normalize_split)
+    if (manifest["session_id"] == "").any():
+        raise ValueError("Session manifest contains an empty session_id.")
+    duplicates = manifest.loc[manifest["session_id"].duplicated(False), "session_id"].unique()
+    if len(duplicates):
+        raise ValueError(f"Session manifest contains duplicate session IDs: {duplicates[:10].tolist()}")
+    expected_splits = {"train", "validation", "test"}
+    if set(manifest["split"]) != expected_splits:
+        raise ValueError(
+            f"Manifest splits must be exactly {sorted(expected_splits)}; "
+            f"observed {sorted(set(manifest['split']))}."
+        )
+    observed_counts = manifest.groupby("split")["session_id"].nunique().to_dict()
+    expected_counts = {
+        "train": EXPECTED_TRAIN_SESSIONS,
+        "validation": EXPECTED_VALIDATION_SESSIONS,
+        "test": EXPECTED_TEST_SESSIONS,
+    }
+    if observed_counts != expected_counts:
+        raise ValueError(
+            f"Manifest session counts mismatch: observed={observed_counts}, "
+            f"expected={expected_counts}."
+        )
+    return manifest
+
+
+def verify_encoder_provenance(
+    model_dir: Path,
+    data_path: Path,
+    session_manifest_path: Path,
+) -> Tuple[Path, Dict[str, object]]:
+    """Reject any encoder that was not trained under the formal protocol."""
+    model_dir = model_dir.expanduser().resolve()
+    if not model_dir.is_dir():
+        raise FileNotFoundError(f"Formal encoder directory does not exist: {model_dir}")
+    provenance_path = model_dir / "encoder_provenance_manifest.json"
+    if not provenance_path.is_file():
+        raise RuntimeError(
+            "Formal encoder provenance manifest is missing: "
+            f"{provenance_path}"
+        )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    required_values = {
+        "formal_fcn_encoder": True,
+        "training_objective": "positive_pair_mnrl_only",
+        "input_format": INPUT_FORMAT,
+        "text_protocol_sha256": TEXT_PROTOCOL_SHA256,
+        "rationale_derived_supervision": False,
+        "targeted_supervision": False,
+        "hard_negative_supervision": False,
+        "direction_auxiliary_supervision": False,
+        "train_only": True,
+    }
+    mismatches = {
+        key: {"observed": provenance.get(key), "required": value}
+        for key, value in required_values.items()
+        if provenance.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"Encoder provenance violates the formal protocol: {mismatches}")
+
+    data_hash = sha256_file(data_path)
+    manifest_hash = sha256_file(session_manifest_path)
+    if provenance.get("train_file_sha256") != data_hash:
+        raise RuntimeError("Encoder was trained from a different candidate-data file.")
+    if provenance.get("session_manifest_sha256") != manifest_hash:
+        raise RuntimeError("Encoder was trained from a different session manifest.")
+    expected_counts = {
+        "train": EXPECTED_TRAIN_SESSIONS,
+        "validation": EXPECTED_VALIDATION_SESSIONS,
+        "test": EXPECTED_TEST_SESSIONS,
+    }
+    if provenance.get("session_counts") != expected_counts:
+        raise RuntimeError(
+            "Encoder provenance has unexpected session counts: "
+            f"{provenance.get('session_counts')}"
+        )
+    return model_dir, provenance
 
 
 def safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -913,10 +1020,11 @@ def add_text_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def encode_embeddings(
     df: pd.DataFrame,
-    model_id: str,
-    modelscope_cache_dir: str,
+    model_dir: str,
     cache_dir: Path,
     batch_size: int,
+    data_sha256: str,
+    encoder_provenance_sha256: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Encode anchors and Q2 candidates using the fixed experiment input format."""
     required = {"Q1", "A1", "Q2"}
@@ -924,16 +1032,19 @@ def encode_embeddings(
     if missing:
         raise ValueError(f"Missing Stage 1 text columns: {sorted(missing)}")
 
-    model_path = resolve_model_path(model_id, cache_dir=modelscope_cache_dir)
+    model_path = str(Path(model_dir).expanduser().resolve())
     cache_dir.mkdir(parents=True, exist_ok=True)
     anchor_cache = cache_dir / "anchor_embeddings.npy"
     cand_cache = cache_dir / "candidate_embeddings.npy"
     meta_cache = cache_dir / "embedding_meta.json"
     meta = {
         "rows": len(df),
-        "model_id": model_id,
+        "model_id": model_dir,
         "model_path": model_path,
-        "input_format": "fixed_no_prompt_q1_a1_semantic_bridge__q2_v1",
+        "input_format": INPUT_FORMAT,
+        "text_protocol_sha256": TEXT_PROTOCOL_SHA256,
+        "data_sha256": data_sha256,
+        "encoder_provenance_sha256": encoder_provenance_sha256,
         "first_edge": str(df.iloc[0]["edge_id"]) if len(df) else "",
         "last_edge": str(df.iloc[-1]["edge_id"]) if len(df) else "",
     }
@@ -1340,14 +1451,6 @@ def compute_interaction_channels(
     return out
 
 
-def split_by_session(df: pd.DataFrame, test_size: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    y = df["edge_label"].to_numpy()
-    groups = df["session_id"].astype(str).to_numpy()
-    train_idx, eval_idx = next(splitter.split(df, y, groups))
-    return train_idx, eval_idx
-
-
 def fit_stage1(X_train: np.ndarray, y_train: np.ndarray) -> object:
     return make_pipeline(
         StandardScaler(),
@@ -1380,12 +1483,15 @@ def stage1_selection_score(df: pd.DataFrame) -> np.ndarray:
 
 
 
-def add_anchor_rank(df: pd.DataFrame, score_col: str) -> pd.Series:
-    """Return deterministic descending within-anchor score ranks.
+def add_source_rank(df: pd.DataFrame, score_col: str) -> pd.Series:
+    """Return deterministic later-query ranks for each source anchor.
 
     Ties follow the existing row order, which is fixed by the input candidate
-    table. The rank is used only to implement the fixed Top-K retention cap.
+    table. The rank implements the fixed Top-K later-query cap for each earlier
+    Q&A source, consistent with Stage 1 source-conditioned retention.
     """
+    if "Q1_row" not in df.columns:
+        raise ValueError("Stage 1 data must contain Q1_row for source-wise Top-K retention.")
     scores = pd.to_numeric(df[score_col], errors="coerce").fillna(0.0)
     return (
         scores.groupby(
@@ -1415,7 +1521,7 @@ def apply_fixed_retention_policy(
     if top_k < 1:
         raise ValueError("top_k must be >= 1")
     score = pd.to_numeric(df[score_col], errors="coerce").fillna(0.0)
-    rank = add_anchor_rank(df, score_col)
+    rank = add_source_rank(df, score_col)
     return ((score >= float(threshold)) & (rank <= int(top_k))).to_numpy(dtype=bool)
 
 
@@ -1444,7 +1550,7 @@ def tune_retention_policy(
     work = validation_df.copy().reset_index(drop=True)
     labels = pd.to_numeric(work["edge_label"], errors="coerce").fillna(0).astype(int)
     scores = pd.to_numeric(work[score_col], errors="coerce").fillna(0.0).astype(float)
-    ranks = add_anchor_rank(work, score_col)
+    ranks = add_source_rank(work, score_col)
 
     total_positive = int(labels.sum())
     if total_positive <= 0:
@@ -1513,15 +1619,6 @@ def tune_retention_policy(
     return float(best["Threshold"]), int(best["TopK"]), search
 
 
-def split_inner_validation_by_session(
-    train_df: pd.DataFrame,
-    validation_size: float,
-    seed: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Create the validation-only tuning split inside the outer Train split."""
-    return split_by_session(train_df, validation_size, seed)
-
-
 def save_stage(df: pd.DataFrame, outdir: Path, name: str) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     df.to_csv(outdir / f"{name}.csv", index=False, encoding="utf-8-sig")
@@ -1537,10 +1634,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--data-file", default=str(DEFAULT_DATA_FILE))
+    parser.add_argument("--session-manifest", required=True)
     parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
     parser.add_argument("--stage1-outdir", default=str(DEFAULT_STAGE1_OUTDIR))
-    parser.add_argument("--embedding-model-id", default="")
-    parser.add_argument("--modelscope-cache-dir", default=DEFAULT_MODELSCOPE_CACHE)
     parser.add_argument("--encode-batch-size", type=int, default=64)
 
     # These values generate auxiliary edge-local channels consumed by Stage 2A.
@@ -1552,47 +1648,27 @@ def parse_args() -> argparse.Namespace:
 
 def build_fixed_three_way_split(
     df: pd.DataFrame,
+    manifest: pd.DataFrame,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Construct and verify the frozen 176/44/55 session split."""
-    outer_train_idx, test_idx = split_by_session(
-        df,
-        test_size=OUTER_TEST_SIZE,
-        seed=SEED,
-    )
-
-    outer_train_df = df.iloc[outer_train_idx].copy().reset_index(drop=True)
-    train_rel_idx, validation_rel_idx = split_inner_validation_by_session(
-        outer_train_df,
-        validation_size=INNER_VALIDATION_SIZE,
-        seed=SEED,
-    )
-
-    train_idx = outer_train_idx[train_rel_idx]
-    validation_idx = outer_train_idx[validation_rel_idx]
-
-    observed = (
-        int(df.iloc[train_idx]["session_id"].nunique()),
-        int(df.iloc[validation_idx]["session_id"].nunique()),
-        int(df.iloc[test_idx]["session_id"].nunique()),
-    )
-    expected = (
-        EXPECTED_TRAIN_SESSIONS,
-        EXPECTED_VALIDATION_SESSIONS,
-        EXPECTED_TEST_SESSIONS,
-    )
-    if observed != expected:
-        raise RuntimeError(
-            "Input data do not reproduce the frozen 176/44/55 session split. "
-            f"Observed={observed}, expected={expected}. "
-            "Check that the same candidate dataset and session IDs are used."
-        )
-
-    train_ids = set(df.iloc[train_idx]["session_id"].astype(str))
-    validation_ids = set(df.iloc[validation_idx]["session_id"].astype(str))
-    test_ids = set(df.iloc[test_idx]["session_id"].astype(str))
-    if train_ids & validation_ids or train_ids & test_ids or validation_ids & test_ids:
-        raise RuntimeError("Train/Validation/Test session sets are not disjoint.")
-
+    """Apply the exact manifest already used for encoder fine-tuning."""
+    if "session_id" not in df.columns:
+        raise ValueError("Candidate data must contain session_id.")
+    session_ids = df["session_id"].astype(str).map(clean_text)
+    manifest_ids = set(manifest["session_id"])
+    data_ids = set(session_ids)
+    unknown = sorted(data_ids - manifest_ids)
+    absent = sorted(manifest_ids - data_ids)
+    if unknown:
+        raise ValueError(f"Candidate data contain sessions absent from manifest: {unknown[:10]}")
+    if absent:
+        raise ValueError(f"Manifest contains sessions absent from candidate data: {absent[:10]}")
+    split_by_session = manifest.set_index("session_id")["split"]
+    row_splits = session_ids.map(split_by_session)
+    if row_splits.isna().any():
+        raise RuntimeError("At least one candidate row could not be assigned to a split.")
+    train_idx = np.flatnonzero(row_splits.eq("train").to_numpy())
+    validation_idx = np.flatnonzero(row_splits.eq("validation").to_numpy())
+    test_idx = np.flatnonzero(row_splits.eq("test").to_numpy())
     return train_idx, validation_idx, test_idx
 
 
@@ -1620,7 +1696,16 @@ def save_split_manifest(
 
 
 def run_stage1(args: argparse.Namespace) -> Path:
-    data_path = Path(args.data_file)
+    data_path = Path(args.data_file).expanduser().resolve()
+    session_manifest_path = Path(args.session_manifest).expanduser().resolve()
+    if not data_path.is_file():
+        raise FileNotFoundError(f"Candidate-data file does not exist: {data_path}")
+    manifest = load_session_manifest(session_manifest_path)
+    model_path, encoder_provenance = verify_encoder_provenance(
+        Path(args.model_dir),
+        data_path,
+        session_manifest_path,
+    )
     outdir = Path(args.stage1_outdir)
     cache_dir = outdir / "embedding_cache"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1635,22 +1720,21 @@ def run_stage1(args: argparse.Namespace) -> Path:
     df = add_text_features(df)
     df = df.reset_index(drop=True)
 
-    embedding_model_id = args.embedding_model_id or str(Path(args.model_dir))
-    if str(embedding_model_id).strip() in {".", "./", ""}:
-        embedding_model_id = str(DEFAULT_MODEL_DIR)
-
     # Fixed encoder representations. No labels are used during encoding.
     anchor_emb, cand_emb = encode_embeddings(
         df=df,
-        model_id=embedding_model_id,
-        modelscope_cache_dir=args.modelscope_cache_dir,
+        model_dir=str(model_path),
         cache_dir=cache_dir,
         batch_size=args.encode_batch_size,
+        data_sha256=sha256_file(data_path),
+        encoder_provenance_sha256=sha256_file(
+            model_path / "encoder_provenance_manifest.json"
+        ),
     )
     X = build_features(df, anchor_emb, cand_emb)
 
     # Frozen 176 / 44 / 55 Train / Validation / Test split.
-    train_idx, validation_idx, test_idx = build_fixed_three_way_split(df)
+    train_idx, validation_idx, test_idx = build_fixed_three_way_split(df, manifest)
 
     train_base = df.iloc[train_idx].copy().reset_index(drop=True)
     validation_base = df.iloc[validation_idx].copy().reset_index(drop=True)
@@ -1790,10 +1874,19 @@ def run_stage1(args: argparse.Namespace) -> Path:
     save_stage(test_scored, outdir, "stage1_test_scored")
 
     selected_params = {
-        "protocol": "fixed_176_44_55_train_validation_test_no_refit",
+        "protocol": "manifest_fixed_176_44_55_train_validation_test_no_refit",
+        "retention_orientation": "source_conditioned",
+        "retention_group_keys": ["session_id", "Q1_row"],
+        "input_format": INPUT_FORMAT,
+        "text_protocol_sha256": TEXT_PROTOCOL_SHA256,
         "seed": SEED,
-        "outer_test_size": OUTER_TEST_SIZE,
-        "inner_validation_size": INNER_VALIDATION_SIZE,
+        "candidate_data_sha256": sha256_file(data_path),
+        "session_manifest_sha256": sha256_file(session_manifest_path),
+        "encoder_training_objective": encoder_provenance["training_objective"],
+        "encoder_train_only": encoder_provenance["train_only"],
+        "rationale_derived_supervision": encoder_provenance[
+            "rationale_derived_supervision"
+        ],
         "session_counts": {
             "train": EXPECTED_TRAIN_SESSIONS,
             "validation": EXPECTED_VALIDATION_SESSIONS,
